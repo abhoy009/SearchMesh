@@ -114,39 +114,39 @@ python ollama_web_search.py --model granite4:latest --max-results 5 --debug "you
 
 ```mermaid
 flowchart TD
-    U[User / CLI] --> M[main()]
-    M --> RT[run_turn()]
-    RT --> OR{ollama_ready?}
-    OR -- No --> E1[Print unreachable error]
-    OR -- Yes --> SN[search_or_not_agent()]
-    SN --> SD{Search needed?}
-    SD -- No --> SA[stream_assistant_response()]
-    SD -- Yes --> QG[query_generator_agent()]
-    QG --> SE[search_engine_results_scraper()]
+    U[User CLI] --> M[Main]
+    M --> RT[Run Turn]
+    RT --> OR{Ollama Ready}
+    OR -- No --> E1[Print Unreachable Error]
+    OR -- Yes --> SN[Search Or Not Agent]
+    SN --> SD{Search Needed}
+    SD -- No --> SA[Stream Assistant Response]
+    SD -- Yes --> QG[Query Generator Agent]
+    QG --> SE[Search Engine Results Scraper]
 
-    SE --> T1{Tier 1}
-    T1 --> OWS[Ollama web_search]
-    OWS -->|no results/fail| T2{Tier 2}
+    SE --> T1{Tier One}
+    T1 --> OWS[Ollama Web Search]
+    OWS -->|No Results Or Fail| T2{Tier Two}
     T2 --> SP[Serper API]
-    SP -->|no results/fail| T3{Tier 3}
+    SP -->|No Results Or Fail| T3{Tier Three}
     T3 --> DDG[DuckDuckGo HTML]
 
-    OWS --> BR[best_search_result_agent()]
+    OWS --> BR[Best Search Result Agent]
     SP --> BR
     DDG --> BR
 
-    BR --> BS[best_result_scraper()]
-    BS --> WF[Ollama web_fetch]
-    WF -->|empty/fail| TF[Trafilatura fallback]
-    WF --> DV[data_validation_agent()]
+    BR --> BS[Best Result Scraper]
+    BS --> WF[Ollama Web Fetch]
+    WF -->|Empty Or Fail| TF[Trafilatura Fallback]
+    WF --> DV[Data Validation Agent]
     TF --> DV
 
-    DV --> VC{Context valid?}
-    VC -- Yes --> AC[add_context_to_user_prompt()]
-    VC -- No --> NP[Use raw user prompt]
+    DV --> VC{Context Valid}
+    VC -- Yes --> AC[Add Context To User Prompt]
+    VC -- No --> NP[Use Raw User Prompt]
     AC --> SA
     NP --> SA
-    SA --> R[Assistant response (streamed)]
+    SA --> R[Assistant Response Streamed]
 ```
 
 ## Troubleshooting
