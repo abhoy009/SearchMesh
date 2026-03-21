@@ -110,6 +110,45 @@ python ollama_web_search.py --model granite4:latest --max-results 5 --debug "you
 7. Context is appended to user payload only when validated.
 8. `stream_assistant_response()` streams final output.
 
+## System Design UML
+
+```mermaid
+flowchart TD
+    U[User / CLI] --> M[main()]
+    M --> RT[run_turn()]
+    RT --> OR{ollama_ready?}
+    OR -- No --> E1[Print unreachable error]
+    OR -- Yes --> SN[search_or_not_agent()]
+    SN --> SD{Search needed?}
+    SD -- No --> SA[stream_assistant_response()]
+    SD -- Yes --> QG[query_generator_agent()]
+    QG --> SE[search_engine_results_scraper()]
+
+    SE --> T1{Tier 1}
+    T1 --> OWS[Ollama web_search]
+    OWS -->|no results/fail| T2{Tier 2}
+    T2 --> SP[Serper API]
+    SP -->|no results/fail| T3{Tier 3}
+    T3 --> DDG[DuckDuckGo HTML]
+
+    OWS --> BR[best_search_result_agent()]
+    SP --> BR
+    DDG --> BR
+
+    BR --> BS[best_result_scraper()]
+    BS --> WF[Ollama web_fetch]
+    WF -->|empty/fail| TF[Trafilatura fallback]
+    WF --> DV[data_validation_agent()]
+    TF --> DV
+
+    DV --> VC{Context valid?}
+    VC -- Yes --> AC[add_context_to_user_prompt()]
+    VC -- No --> NP[Use raw user prompt]
+    AC --> SA
+    NP --> SA
+    SA --> R[Assistant response (streamed)]
+```
+
 ## Troubleshooting
 
 - `Ollama is not running or unreachable`
