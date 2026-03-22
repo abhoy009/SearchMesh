@@ -2,7 +2,7 @@
 
 A local Python assistant powered by Ollama with optional web augmentation.
 
-The project uses a single, stateless pipeline in `ollama_web_search.py`:
+The runtime pipeline now executes from `src/` modules (with `ollama_web_search.py` as compatibility launcher):
 
 - Decide whether search is needed
 - Generate a query
@@ -10,6 +10,12 @@ The project uses a single, stateless pipeline in `ollama_web_search.py`:
 - Select best URL
 - Fetch and validate context
 - Answer with streamed output
+
+## Refactor Status
+
+- Refactor-first migration is in progress (see `neststep.md`).
+- Phase 0 baseline is documented in `docs/refactor_baseline.md`.
+- Phase 2/3 extraction is active: core search/fetch/validation/orchestration flow now runs through `src/`.
 
 ## Features
 
@@ -30,11 +36,17 @@ The project uses a single, stateless pipeline in `ollama_web_search.py`:
 
 ```text
 .
-├── ollama_web_search.py     # Main pipeline + CLI
+├── ollama_web_search.py     # Compatibility launcher
+├── src/
+│   ├── app/                 # CLI + config + orchestrator + models/interfaces
+│   ├── services/            # Decision/query/search/rank/fetch/validate/respond logic
+│   └── infra/               # Ollama client + HTTP helpers + logging scaffold
+├── tests/                   # Unit + integration scaffold
+├── docs/refactor_baseline.md
 ├── requirements.txt         # Python dependencies
 ├── .env.example             # Environment variable template
 ├── pyrightconfig.json       # Type-checker config
-└── sys_msg.py               # Legacy prompt module (currently unused)
+└── .ai/                     # Persistent project memory/handoff docs
 ```
 
 ## Requirements
@@ -96,19 +108,26 @@ With options:
 python ollama_web_search.py --model granite4:latest --max-results 5 --debug "your query"
 ```
 
+Module CLI entrypoint:
+
+```bash
+python -m src.app.cli "your query"
+```
+
 ## Pipeline Overview
 
-1. `search_or_not_agent()` decides if fresh data is needed.
-2. `query_generator_agent()` generates a concise search query.
-3. `search_engine_results_scraper()` tries:
+1. `DefaultTurnOrchestrator.run_turn()` coordinates each turn.
+2. `DecisionEngineService.should_search()` decides if fresh data is needed.
+3. `QueryGeneratorService.generate()` creates concise web query text.
+4. `FallbackSearchProvider.search()` tries:
    1. Ollama `web_search`
    2. `_serper_search()`
    3. `_duckduckgo_search()`
-4. `best_search_result_agent()` picks the best URL.
-5. `best_result_scraper()` fetches content (`web_fetch` then Trafilatura).
-6. `data_validation_agent()` validates context relevance.
-7. Context is appended to user payload only when validated.
-8. `stream_assistant_response()` streams final output.
+5. `RankingService.pick_best()` selects best URL.
+6. `FetcherService.fetch()` fetches content (`web_fetch` then Trafilatura).
+7. `ValidatorService.is_relevant()` validates context relevance.
+8. Context is appended only when validated.
+9. `ResponderService.stream()` streams final output.
 
 ## System Design UML
 
