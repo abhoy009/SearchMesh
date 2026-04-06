@@ -12,3 +12,9 @@ __pycache__/
 
 #Ai
 .ai/
+
+#Evaluate
+evaluate/
+
+# Code Review Graph
+.code-review-graph/

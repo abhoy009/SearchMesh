@@ -1,54 +1,84 @@
-from __future__ import annotations
+"""Deterministic source ranking — no LLM calls.
 
-import json
-from typing import Any
+Implements the scoring algorithm from plan.md exactly:
+  - Keyword overlap between query and title+snippet (weight: 0.4)
+  - Source trust weight: serper=1.0, ollama=0.8, duckduckgo=0.6 (weight: 0.3)
+  - URL heuristics: penalize social/forum domains (−0.2)
+  - Snippet length as content signal (weight: 0.3)
+
+Result: deterministic, testable, fast. Zero LLM calls.
+This replaces the old LLM-based pick_best() which was taking 5+ minutes.
+"""
+from __future__ import annotations
 
 from src.app.models import SearchResult
 
-BEST_RESULT_PROMPT = (
-    "Pick the single best URL from candidate web search results for answering the user message. "
-    "Return exactly one URL and nothing else."
-)
+_PENALIZED_DOMAINS = ["reddit.com", "quora.com", "twitter.com", "facebook.com", "x.com"]
+_SOURCE_TRUST = {"serper": 1.0, "ollama": 0.8, "duckduckgo": 0.6}
 
 
-def _message_content(message: Any) -> str:
-    content = getattr(message, "content", "")
-    return content if isinstance(content, str) else ""
+def score_result(result: SearchResult, query: str) -> float:
+    score = 0.0
+
+    # Keyword overlap between query tokens and title+snippet
+    query_tokens = set(query.lower().split())
+    text = (result.title + " " + result.content).lower()
+    result_tokens = set(text.split())
+    overlap = len(query_tokens & result_tokens) / max(len(query_tokens), 1)
+    score += overlap * 0.4
+
+    # Source trust weight
+    trust = _SOURCE_TRUST.get(result.source, 0.5)
+    score += trust * 0.3
+
+    # URL heuristics: penalize social/forum domains
+    if any(d in result.url for d in _PENALIZED_DOMAINS):
+        score -= 0.2
+
+    # Prefer results with longer snippets (more content signal)
+    score += min(len(result.content) / 500, 1.0) * 0.3
+
+    return round(max(score, 0.0), 4)
+
+
+def rank_results(results: list[SearchResult], query: str) -> list[SearchResult]:
+    """Score, deduplicate by domain, and sort descending by score."""
+    if not results:
+        return []
+
+    # Score each result
+    scored = [(r, score_result(r, query)) for r in results]
+
+    # Deduplicate: keep only highest-scored result per domain
+    seen_domains: dict[str, tuple[SearchResult, float]] = {}
+    for result, score in scored:
+        try:
+            from urllib.parse import urlparse
+            domain = urlparse(result.url).netloc
+        except Exception:
+            domain = result.url
+
+        existing = seen_domains.get(domain)
+        if existing is None or score > existing[1]:
+            seen_domains[domain] = (result, score)
+
+    deduped = list(seen_domains.values())
+    deduped.sort(key=lambda x: x[1], reverse=True)
+
+    # Return SearchResult objects with score field populated
+    ranked: list[SearchResult] = []
+    for result, score in deduped:
+        result.score = score
+        ranked.append(result)
+
+    return ranked
 
 
 class RankingService:
-    def __init__(self, client: Any, model: str) -> None:
-        self.client = client
-        self.model = model
+    """Deterministic ranker — no LLM, no network calls, instant."""
 
     def pick_best(self, user_input: str, results: list[SearchResult]) -> str | None:
         if not results:
             return None
-
-        serializable = [{"title": r.title, "url": r.url, "content": r.content} for r in results]
-        formatted = json.dumps(serializable, ensure_ascii=True, indent=2)
-        response = self.client.chat(
-            model=self.model,
-            messages=[
-                {"role": "system", "content": BEST_RESULT_PROMPT},
-                {
-                    "role": "user",
-                    "content": f"User prompt: {user_input}\n\nCandidate results:\n{formatted}",
-                },
-            ],
-        )
-
-        raw = _message_content(response.message).strip()
-        if not raw:
-            return results[0].url
-
-        token = raw.split()[0]
-        for item in results:
-            if item.url == token:
-                return token
-
-        for item in results:
-            if item.url in raw:
-                return item.url
-
-        return results[0].url
+        ranked = rank_results(results, user_input)
+        return ranked[0].url if ranked else results[0].url

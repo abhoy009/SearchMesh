@@ -1,13 +1,16 @@
+"""Decision engine — determines whether a user message needs web search."""
 from __future__ import annotations
 
+import asyncio
 import re
 from typing import Any
 
 SEARCH_OR_NOT_PROMPT = (
-    "You decide whether web search is needed for the user message. "
-    "Reply with exactly one token: True or False. "
-    "Return True for current events, prices, weather, schedules, releases, or any fact likely to change. "
-    "Return False for reasoning, coding, writing, math, and stable knowledge."
+    'Respond with only "search" or "skip".\n'
+    "Output \"search\" if the question needs current web data (news, prices, live events, recent facts).\n"
+    "Output \"skip\" if it can be answered from general knowledge (math, definitions, history, greetings).\n"
+    "Do not output anything else."
+    # "Analyze if the user query requires looking up recent information, prices, news, or dynamic facts from the internet."
 )
 
 
@@ -16,8 +19,24 @@ def _message_content(message: Any) -> str:
     return content if isinstance(content, str) else ""
 
 
-def _bool_from_text(text: str) -> bool:
-    return text.strip().lower().startswith("true")
+
+def _sync_should_search(client: Any, model: str, user_input: str) -> bool:
+    """Runs the Ollama call synchronously — called via asyncio.to_thread."""
+    prompt = user_input.strip().lower()
+    if prompt in {"hi", "hello", "hey"}:
+        return False
+    if re.fullmatch(r"[0-9\s\+\-\*\/\(\)\.=]+", prompt):
+        return False
+
+    response = client.chat(
+        model=model,
+        messages=[
+            {"role": "system", "content": SEARCH_OR_NOT_PROMPT},
+            {"role": "user", "content": user_input},
+        ],
+    )
+    content = _message_content(response.message).strip().lower()
+    return content.startswith("search")
 
 
 class DecisionEngineService:
@@ -25,18 +44,5 @@ class DecisionEngineService:
         self.client = client
         self.model = model
 
-    def should_search(self, user_input: str) -> bool:
-        prompt = user_input.strip().lower()
-        if prompt in {"hi", "hello", "hey"}:
-            return False
-        if re.fullmatch(r"[0-9\\s\\+\\-\\*\\/\\(\\)\\.\\=]+", prompt):
-            return False
-
-        response = self.client.chat(
-            model=self.model,
-            messages=[
-                {"role": "system", "content": SEARCH_OR_NOT_PROMPT},
-                {"role": "user", "content": user_input},
-            ],
-        )
-        return _bool_from_text(_message_content(response.message))
+    async def should_search(self, user_input: str) -> bool:
+        return await asyncio.to_thread(_sync_should_search, self.client, self.model, user_input)

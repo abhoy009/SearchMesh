@@ -1,10 +1,12 @@
+"""Context validator — decides if fetched web content is relevant to the query."""
 from __future__ import annotations
 
+import asyncio
+import json
 from typing import Any
 
 DATA_VALIDATION_PROMPT = (
-    "You are a strict validator. Decide if the provided web context is relevant and useful "
-    "for answering the user message. Reply exactly True or False."
+    "Evaluate if the provided web context contains information relevant to answering the user prompt."
 )
 MAX_VALIDATION_CHARS = 4000
 
@@ -14,8 +16,34 @@ def _message_content(message: Any) -> str:
     return content if isinstance(content, str) else ""
 
 
-def _bool_from_text(text: str) -> bool:
-    return text.strip().lower().startswith("true")
+
+def _sync_is_relevant(client: Any, model: str, user_input: str, context: str) -> bool:
+    """Sync Ollama call — executed in a thread by asyncio.to_thread."""
+    if not context:
+        return False
+    response = client.chat(
+        model=model,
+        messages=[
+            {"role": "system", "content": DATA_VALIDATION_PROMPT},
+            {
+                "role": "user",
+                "content": (
+                    f"User prompt: {user_input}\n\n"
+                    f"Web context:\n{context[:MAX_VALIDATION_CHARS]}"
+                ),
+            },
+        ],
+        format={
+            "type": "object",
+            "properties": {"is_relevant": {"type": "boolean"}},
+            "required": ["is_relevant"]
+        }
+    )
+    content = _message_content(response.message)
+    try:
+        return bool(json.loads(content).get("is_relevant", False))
+    except Exception:
+        return False
 
 
 class ValidatorService:
@@ -23,21 +51,7 @@ class ValidatorService:
         self.client = client
         self.model = model
 
-    def is_relevant(self, user_input: str, context: str) -> bool:
+    async def is_relevant(self, user_input: str, context: str) -> bool:
         if not context:
             return False
-
-        response = self.client.chat(
-            model=self.model,
-            messages=[
-                {"role": "system", "content": DATA_VALIDATION_PROMPT},
-                {
-                    "role": "user",
-                    "content": (
-                        f"User prompt: {user_input}\n\n"
-                        f"Web context:\n{context[:MAX_VALIDATION_CHARS]}"
-                    ),
-                },
-            ],
-        )
-        return _bool_from_text(_message_content(response.message))
+        return await asyncio.to_thread(_sync_is_relevant, self.client, self.model, user_input, context)

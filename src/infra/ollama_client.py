@@ -1,7 +1,10 @@
+"""Ollama client builder and readiness helpers."""
 from __future__ import annotations
 
-import os
+import asyncio
 from typing import Any
+
+from src.app.config import settings
 
 
 def import_ollama() -> Any:
@@ -13,8 +16,8 @@ def import_ollama() -> Any:
 
 
 def build_client(ollama: Any) -> Any:
-    host = os.getenv("OLLAMA_HOST", "").strip()
-    api_key = os.getenv("OLLAMA_API_KEY", "").strip()
+    host = settings.ollama_host.strip()
+    api_key = settings.ollama_api_key.strip()
 
     if host and api_key:
         return ollama.Client(host=host, headers={"Authorization": f"Bearer {api_key}"})
@@ -31,3 +34,8 @@ def is_ready(client: Any) -> bool:
         return True
     except Exception:
         return False
+
+
+async def is_ready_async(client: Any) -> bool:
+    """Non-blocking readiness check — wraps the sync SDK call in a thread."""
+    return await asyncio.to_thread(is_ready, client)
