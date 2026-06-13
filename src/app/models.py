@@ -33,3 +33,4 @@ class TurnResult:
     fetch_method: str = "none"
     latency: dict[str, float] = field(default_factory=dict)
     metrics: TurnMetrics = field(default_factory=TurnMetrics)
+    cache_hit: bool = False

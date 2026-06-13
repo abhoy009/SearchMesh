@@ -47,6 +47,7 @@ class ChatRequest(BaseModel):
     use_web: bool = Field(default=True, description="If false, skip decision step and answer from model knowledge")
     model: str | None = Field(default=None, description="Override Ollama model for this request")
     max_context_chars: int | None = Field(default=None, ge=100, le=32000, description="Max chars of fetched context")
+    stream: bool = Field(default=False, description="Whether to stream the response back")
 
 
 class ChatResponse(BaseModel):

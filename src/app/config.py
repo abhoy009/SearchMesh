@@ -42,12 +42,18 @@ class Settings(BaseSettings):
     # Context
     max_context_chars: int = 4000
 
+    # API Security
+    api_key: str = ""
+
     # Debug
     agent_debug: bool = False
 
     # Session (used in M3, defined here for /v1/config)
     session_ttl_seconds: int = 3600
     session_max_turns: int = 20
+
+    # Redis
+    redis_url: str = "redis://localhost:6379"
 
     # Cache TTL (used in M2, defined here for /v1/config)
     cache_search_ttl_seconds: int = 600

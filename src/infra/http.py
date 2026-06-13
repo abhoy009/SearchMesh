@@ -33,16 +33,49 @@ def get_http_client() -> httpx.AsyncClient:
     return _client
 
 
-async def async_get(url: str, timeout: float = 10.0, headers: dict | None = None) -> str:
-    """Perform an async GET request and return the response body as text."""
+import asyncio
+import logging
+
+logger = logging.getLogger(__name__)
+
+async def _with_retry(func, *args, retries=3, base_delay=1.0, **kwargs):
+    for attempt in range(1, retries + 1):
+        try:
+            return await func(*args, **kwargs)
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code < 500:
+                raise
+            if attempt == retries:
+                raise
+            delay = base_delay * (2 ** (attempt - 1))
+            logger.warning(f"HTTP 5xx Error: {e}. Retrying in {delay}s...")
+            await asyncio.sleep(delay)
+        except httpx.RequestError as e:
+            if attempt == retries:
+                raise
+            delay = base_delay * (2 ** (attempt - 1))
+            logger.warning(f"HTTP Request Error: {e}. Retrying in {delay}s...")
+            await asyncio.sleep(delay)
+
+async def _do_get(url: str, timeout: float, merged_headers: dict) -> str:
     client = get_http_client()
-    merged_headers = {"User-Agent": _USER_AGENT}
-    if headers:
-        merged_headers.update(headers)
     response = await client.get(url, headers=merged_headers, timeout=timeout, follow_redirects=True)
     response.raise_for_status()
     return response.text
 
+async def async_get(url: str, timeout: float = 10.0, headers: dict | None = None) -> str:
+    """Perform an async GET request and return the response body as text."""
+    merged_headers = {"User-Agent": _USER_AGENT}
+    if headers:
+        merged_headers.update(headers)
+    return await _with_retry(_do_get, url, timeout, merged_headers)
+
+
+async def _do_post(url: str, json: dict | None, timeout: float, merged_headers: dict) -> dict:
+    client = get_http_client()
+    response = await client.post(url, json=json, headers=merged_headers, timeout=timeout)
+    response.raise_for_status()
+    return response.json()
 
 async def async_post(
     url: str,
@@ -51,10 +84,7 @@ async def async_post(
     timeout: float = 10.0,
 ) -> dict:
     """Perform an async POST request and return the parsed JSON response."""
-    client = get_http_client()
     merged_headers = {"User-Agent": _USER_AGENT, "Content-Type": "application/json"}
     if headers:
         merged_headers.update(headers)
-    response = await client.post(url, json=json, headers=merged_headers, timeout=timeout)
-    response.raise_for_status()
-    return response.json()
+    return await _with_retry(_do_post, url, json, timeout, merged_headers)

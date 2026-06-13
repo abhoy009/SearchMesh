@@ -50,6 +50,9 @@ from src.services.responder import ResponderService
 from src.services.search_providers import FallbackSearchProvider
 from src.services.validator import ValidatorService
 
+from redis.asyncio import Redis
+from src.infra.cache import SearchMeshCache
+
 logger = get_logger(__name__)
 
 # Module-level references set during lifespan startup
@@ -57,6 +60,8 @@ _orchestrator: DefaultTurnOrchestrator | None = None
 _search_provider: FallbackSearchProvider | None = None
 _fetcher: FetcherService | None = None
 _ollama_client: Any = None
+_redis_client: Redis | None = None
+_cache: SearchMeshCache | None = None
 
 _server_start_time = time.monotonic()
 
@@ -67,11 +72,22 @@ _server_start_time = time.monotonic()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _orchestrator, _search_provider, _fetcher, _ollama_client
+    global _orchestrator, _search_provider, _fetcher, _ollama_client, _redis_client, _cache
 
     # Shared async HTTP client
     client = httpx.AsyncClient(timeout=30.0)
     http_module.set_http_client(client)
+
+    # Redis Cache initialization
+    if settings.redis_url:
+        try:
+            _redis_client = Redis.from_url(settings.redis_url)
+            _cache = SearchMeshCache(_redis_client)
+        except Exception as exc:
+            logger.warning("Failed to initialize Redis client: %s", exc)
+            _cache = SearchMeshCache(None)
+    else:
+        _cache = SearchMeshCache(None)
 
     # Ollama
     ollama_lib = import_ollama()
@@ -104,6 +120,7 @@ async def lifespan(app: FastAPI):
         validator=validator,
         responder=responder,
         max_results=settings.max_results,
+        cache=_cache,
     )
 
     ready = await is_ready_async(_ollama_client)
@@ -120,12 +137,16 @@ async def lifespan(app: FastAPI):
     yield  # app runs here
 
     await client.aclose()
+    if _redis_client:
+        await _redis_client.aclose()
     logger.info("SearchMesh server shut down")
 
 
 # ---------------------------------------------------------------------------
 # App
 # ---------------------------------------------------------------------------
+
+from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI(
     title="SearchMesh",
@@ -134,6 +155,14 @@ app = FastAPI(
     lifespan=lifespan,
     docs_url="/docs",
     redoc_url="/redoc",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
@@ -151,6 +180,24 @@ async def request_id_middleware(request: Request, call_next):
         return response
     finally:
         request_id_ctx.reset(token)
+
+@app.middleware("http")
+async def api_key_auth_middleware(request: Request, call_next):
+    if settings.api_key:
+        exempt_paths = {"/v1/health", "/docs", "/redoc", "/openapi.json", "/"}
+        if request.url.path not in exempt_paths and not request.url.path.startswith("/static"):
+            key = request.headers.get("x-api-key")
+            if not key or key != settings.api_key:
+                request_id = request_id_ctx.get("")
+                return JSONResponse(
+                    status_code=401,
+                    content=ErrorResponse(
+                        error="unauthorized",
+                        detail="Invalid or missing X-API-Key header",
+                        request_id=request_id,
+                    ).model_dump(),
+                )
+    return await call_next(request)
 
 
 # ---------------------------------------------------------------------------
@@ -178,7 +225,6 @@ async def global_exception_handler(request: Request, exc: Exception):
     )
 
 
-# ---------------------------------------------------------------------------
 # Helper: build SourceResult list from domain SearchResult list
 # ---------------------------------------------------------------------------
 
@@ -199,7 +245,9 @@ def _to_source_results(results: list[SearchResult]) -> list[SourceResult]:
 # POST /v1/chat
 # ---------------------------------------------------------------------------
 
-@app.post("/v1/chat", response_model=ChatResponse, tags=["pipeline"])
+from fastapi.responses import JSONResponse, StreamingResponse
+
+@app.post("/v1/chat", tags=["pipeline"])
 async def chat(request: ChatRequest):
     """Run the full pipeline: decision → query gen → search → fetch → validate → respond."""
     request_id = request_id_ctx.get("")
@@ -217,6 +265,28 @@ async def chat(request: ChatRequest):
     # Synthetic session_id for M1 — real persistence comes in M3
     session_id = request.session_id or str(uuid.uuid4())
     history: list[dict] = []
+
+    if request.stream:
+        async def event_generator():
+            try:
+                async for chunk in _orchestrator.stream_turn(
+                    user_input=request.message,
+                    history=history,
+                    use_web=request.use_web,
+                    model=request.model,
+                    max_context_chars=request.max_context_chars or settings.max_context_chars,
+                ):
+                    yield f"data: {chunk}\n\n"
+            except Exception as exc:
+                logger.error("Pipeline error during streaming", extra={"error": str(exc), "traceback": traceback.format_exc()})
+                error_msg = ErrorResponse(
+                    error="llm_unavailable",
+                    detail="Ollama is unreachable or returned an error",
+                    request_id=request_id,
+                ).model_dump_json()
+                yield f"data: {{\"type\": \"error\", \"data\": {error_msg}}}\n\n"
+        
+        return StreamingResponse(event_generator(), media_type="text/event-stream")
 
     try:
         result = await _orchestrator.run_turn(
@@ -251,7 +321,7 @@ async def chat(request: ChatRequest):
             respond=lat.get("respond", 0.0),
             total=lat.get("total", 0.0),
         ),
-        cache_hit=False,
+        cache_hit=result.cache_hit,
         request_id=request_id,
     )
 
@@ -277,22 +347,63 @@ async def search(request: SearchRequest):
 
     t0 = time.monotonic()
     max_results = request.max_results or 5
+    cache_hit = False
+    provider_used = "none"
+    results = []
 
-    try:
-        results, provider_used = await _search_provider.search(
-            query=request.query,
-            max_results=max_results,
-        )
-    except Exception as exc:
-        logger.error("Search error", extra={"error": str(exc)})
-        return JSONResponse(
-            status_code=502,
-            content=ErrorResponse(
-                error="all_providers_failed",
-                detail="All search providers failed or returned empty results",
-                request_id=request_id,
-            ).model_dump(),
-        )
+    # Check Cache
+    if _cache:
+        cache_key = _cache._search_key(request.query)
+        cached_data = await _cache.get(cache_key)
+        if cached_data:
+            try:
+                import json
+                parsed = json.loads(cached_data)
+                results = [
+                    SearchResult(
+                        title=r["title"],
+                        url=r["url"],
+                        content=r.get("content", r.get("snippet", "")),
+                        source=r["source"],
+                        score=r.get("score", 0.0),
+                        snippet=r.get("snippet", "")
+                    )
+                    for r in parsed.get("results", [])
+                ]
+                provider_used = parsed.get("provider_used", "unknown")
+                cache_hit = True
+            except Exception as e:
+                logger.warning("Failed to parse cached search results: %s", e)
+
+    if not cache_hit:
+        try:
+            results, provider_used = await _search_provider.search(
+                query=request.query,
+                max_results=max_results,
+            )
+            if _cache and results:
+                import json
+                from dataclasses import asdict
+                cache_key = _cache._search_key(request.query)
+                payload = {
+                    "results": [asdict(r) for r in results],
+                    "provider_used": provider_used
+                }
+                await _cache.set(
+                    cache_key,
+                    json.dumps(payload),
+                    settings.cache_search_ttl_seconds
+                )
+        except Exception as exc:
+            logger.error("Search error", extra={"error": str(exc)})
+            return JSONResponse(
+                status_code=502,
+                content=ErrorResponse(
+                    error="all_providers_failed",
+                    detail="All search providers failed or returned empty results",
+                    request_id=request_id,
+                ).model_dump(),
+            )
 
     latency_ms = round((time.monotonic() - t0) * 1000, 2)
 
@@ -325,7 +436,7 @@ async def search(request: SearchRequest):
         results=items,
         provider_used=provider_used,
         query_used=request.query,
-        cache_hit=False,
+        cache_hit=cache_hit,
         latency_ms=latency_ms,
         request_id=request_id,
     )
@@ -352,19 +463,45 @@ async def fetch(request: FetchRequest):
 
     max_chars = request.max_chars or 8000
     t0 = time.monotonic()
+    cache_hit = False
+    text = ""
+    method = "none"
 
-    try:
-        text, method = await _fetcher.fetch(request.url, max_chars=max_chars)
-    except Exception as exc:
-        logger.error("Fetch error", extra={"url": request.url, "error": str(exc)})
-        return JSONResponse(
-            status_code=504,
-            content=ErrorResponse(
-                error="fetch_timeout",
-                detail=f"Fetch failed: {type(exc).__name__}",
-                request_id=request_id,
-            ).model_dump(),
-        )
+    if _cache:
+        cache_key = _cache._fetch_key(request.url)
+        cached_data = await _cache.get(cache_key)
+        if cached_data:
+            try:
+                import json
+                parsed = json.loads(cached_data)
+                text = parsed.get("text", "")
+                method = parsed.get("method", "none")
+                cache_hit = True
+            except Exception as e:
+                logger.warning("Failed to parse cached fetch response: %s", e)
+
+    if not cache_hit:
+        try:
+            text, method = await _fetcher.fetch(request.url, max_chars=max_chars)
+            if _cache:
+                import json
+                cache_key = _cache._fetch_key(request.url)
+                payload = {"text": text, "method": method}
+                await _cache.set(
+                    cache_key,
+                    json.dumps(payload),
+                    settings.cache_fetch_ttl_seconds
+                )
+        except Exception as exc:
+            logger.error("Fetch error", extra={"url": request.url, "error": str(exc)})
+            return JSONResponse(
+                status_code=504,
+                content=ErrorResponse(
+                    error="fetch_timeout",
+                    detail=f"Fetch failed: {type(exc).__name__}",
+                    request_id=request_id,
+                ).model_dump(),
+            )
 
     latency_ms = round((time.monotonic() - t0) * 1000, 2)
 
@@ -373,7 +510,7 @@ async def fetch(request: FetchRequest):
         text=text,
         char_count=len(text),
         method=method,
-        cache_hit=False,
+        cache_hit=cache_hit,
         success=bool(text),
         latency_ms=latency_ms,
         request_id=request_id,
@@ -394,7 +531,15 @@ async def health():
         except Exception:
             ollama_ok = False
 
-    overall = "ok" if ollama_ok else "degraded"
+    redis_status = "not_configured"
+    if _redis_client is not None:
+        try:
+            await _redis_client.ping()
+            redis_status = "ok"
+        except Exception:
+            redis_status = "unreachable"
+
+    overall = "ok" if (ollama_ok and redis_status in ("ok", "not_configured")) else "degraded"
     uptime = round(time.monotonic() - _server_start_time, 1)
 
     return HealthResponse(
@@ -405,8 +550,8 @@ async def health():
             model=settings.ollama_model,
         ),
         redis=RedisHealth(
-            status="not_configured",
-            host="redis://localhost:6379",
+            status=redis_status,
+            host=settings.redis_url or "redis://localhost:6379",
         ),
         uptime_seconds=uptime,
         version="0.1.0",
@@ -439,3 +584,18 @@ async def config():
             global_seconds=settings.timeout_global_seconds,
         ),
     )
+
+
+# ---------------------------------------------------------------------------
+# DELETE /v1/cache
+# ---------------------------------------------------------------------------
+
+@app.delete("/v1/cache", tags=["ops"])
+async def delete_cache():
+    """Clear all Redis cache entries (search and fetch keys)."""
+    request_id = request_id_ctx.get("")
+    deleted_count = 0
+    if _cache:
+        deleted_count += await _cache.delete_pattern("search:*")
+        deleted_count += await _cache.delete_pattern("fetch:*")
+    return {"status": "ok", "deleted_keys": deleted_count, "request_id": request_id}

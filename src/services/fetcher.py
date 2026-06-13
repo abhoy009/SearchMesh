@@ -28,17 +28,23 @@ def _web_fetch_content(ollama: Any, url: str) -> str:
     return str(content or "").strip()
 
 
-def _trafilatura_fetch(url: str) -> str:
-    """Sync trafilatura fetch — run in a thread."""
+async def _trafilatura_fetch(url: str) -> str:
+    """Async trafilatura fetch using our HTTP client."""
     try:
         import trafilatura
     except Exception:
         return ""
-    downloaded = trafilatura.fetch_url(url)
-    if not downloaded:
+    try:
+        from src.infra.http import async_get
+        html = await async_get(url)
+        if not html:
+            return ""
+        extracted = await asyncio.to_thread(
+            trafilatura.extract, html, False, False
+        )
+        return (extracted or "").strip()
+    except Exception:
         return ""
-    extracted = trafilatura.extract(downloaded, include_links=False, include_images=False)
-    return (extracted or "").strip()
 
 
 class FetcherService:
@@ -54,7 +60,7 @@ class FetcherService:
         if content:
             return content[:max_chars], "web_fetch"
 
-        content = await asyncio.to_thread(_trafilatura_fetch, url)
+        content = await _trafilatura_fetch(url)
         if content:
             return content[:max_chars], "trafilatura"
 

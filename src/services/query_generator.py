@@ -5,8 +5,10 @@ import asyncio
 from typing import Any
 
 QUERY_GENERATION_PROMPT = (
-    "Rewrite the user message as a short web search query (5 words max).\n"
-    "Output ONLY the query. No explanation, no quotes, no punctuation."
+    "Rewrite the user message as a short web search query (15 words max).\n"
+    "Output ONLY the query. No explanation, no quotes, no punctuation , no /n."
+    # "Generate one concise search query for the user message. "
+    # "Return only the query text."
 )
 
 
