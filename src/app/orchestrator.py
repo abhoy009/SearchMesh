@@ -40,11 +40,12 @@ class DefaultTurnOrchestrator:
     responder: Responder
     max_results: int = 5
     cache: Any = None
+    session_store: Any = None
 
     async def _prepare_turn(
         self,
         user_input: str,
-        history: list[dict[str, str]],
+        session_id: str | None = None,
         use_web: bool = True,
         max_context_chars: int = MAX_CONTEXT_CHARS_DEFAULT,
     ) -> dict:
@@ -194,6 +195,7 @@ class DefaultTurnOrchestrator:
                 fetch_method = "search_snippets"
 
         # Build messages for Ollama
+        history = await self.session_store.get_history(session_id) if self.session_store and session_id else []
         messages = list(history)
         if chosen_url and context:
             sys_prompt = build_rag_system_prompt(chosen_url, context, max_context_chars)
@@ -219,12 +221,12 @@ class DefaultTurnOrchestrator:
     async def run_turn(
         self,
         user_input: str,
-        history: list[dict[str, str]],
+        session_id: str | None = None,
         use_web: bool = True,
         model: str | None = None,
         max_context_chars: int = MAX_CONTEXT_CHARS_DEFAULT,
     ) -> TurnResult:
-        prep = await self._prepare_turn(user_input, history, use_web, max_context_chars)
+        prep = await self._prepare_turn(user_input, session_id, use_web, max_context_chars)
         messages = prep["messages"]
         latency = prep["latency"]
 
@@ -233,6 +235,9 @@ class DefaultTurnOrchestrator:
         t0 = time.monotonic()
         assistant_text = await self.responder.respond(messages)
         latency["respond"] = round((time.monotonic() - t0) * 1000, 2)
+        
+        if self.session_store and session_id:
+            await self.session_store.append_turn(session_id, user_input, assistant_text)
 
         latency["total"] = round((time.monotonic() - prep["total_start"]) * 1000, 2)
 
@@ -257,14 +262,14 @@ class DefaultTurnOrchestrator:
     async def stream_turn(
         self,
         user_input: str,
-        history: list[dict[str, str]],
+        session_id: str | None = None,
         use_web: bool = True,
         model: str | None = None,
         max_context_chars: int = MAX_CONTEXT_CHARS_DEFAULT,
     ):
         """Yields JSON chunks with SSE-style events: type='token'|'metadata'."""
         import time
-        prep = await self._prepare_turn(user_input, history, use_web, max_context_chars)
+        prep = await self._prepare_turn(user_input, session_id, use_web, max_context_chars)
         messages = prep["messages"]
         latency = prep["latency"]
         
@@ -288,6 +293,9 @@ class DefaultTurnOrchestrator:
             assistant_text += token
             yield json.dumps({"type": "token", "content": token})
             
+        if self.session_store and session_id:
+            await self.session_store.append_turn(session_id, user_input, assistant_text)
+            
         latency["respond"] = round((time.monotonic() - t0) * 1000, 2)
         latency["total"] = round((time.monotonic() - prep["total_start"]) * 1000, 2)
         
@@ -295,6 +303,7 @@ class DefaultTurnOrchestrator:
             "type": "final",
             "data": {
                 "assistant_text": assistant_text,
+                "session_id": session_id,
                 "latency": latency,
                 "metrics": {
                     "search_used": prep["use_search"],

@@ -52,6 +52,7 @@ from src.services.validator import ValidatorService
 
 from redis.asyncio import Redis
 from src.infra.cache import SearchMeshCache
+from src.services.session import SessionStore
 
 logger = get_logger(__name__)
 
@@ -62,6 +63,7 @@ _fetcher: FetcherService | None = None
 _ollama_client: Any = None
 _redis_client: Redis | None = None
 _cache: SearchMeshCache | None = None
+_session_store: SessionStore | None = None
 
 _server_start_time = time.monotonic()
 
@@ -72,7 +74,7 @@ _server_start_time = time.monotonic()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _orchestrator, _search_provider, _fetcher, _ollama_client, _redis_client, _cache
+    global _orchestrator, _search_provider, _fetcher, _ollama_client, _redis_client, _cache, _session_store
 
     # Shared async HTTP client
     client = httpx.AsyncClient(timeout=30.0)
@@ -83,11 +85,14 @@ async def lifespan(app: FastAPI):
         try:
             _redis_client = Redis.from_url(settings.redis_url)
             _cache = SearchMeshCache(_redis_client)
+            _session_store = SessionStore(_redis_client, ttl=settings.session_ttl_seconds, max_turns=settings.session_max_turns)
         except Exception as exc:
             logger.warning("Failed to initialize Redis client: %s", exc)
             _cache = SearchMeshCache(None)
+            _session_store = SessionStore(None)
     else:
         _cache = SearchMeshCache(None)
+        _session_store = SessionStore(None)
 
     # Ollama
     ollama_lib = import_ollama()
@@ -121,6 +126,7 @@ async def lifespan(app: FastAPI):
         responder=responder,
         max_results=settings.max_results,
         cache=_cache,
+        session_store=_session_store,
     )
 
     ready = await is_ready_async(_ollama_client)
@@ -264,14 +270,13 @@ async def chat(request: ChatRequest):
 
     # Synthetic session_id for M1 — real persistence comes in M3
     session_id = request.session_id or str(uuid.uuid4())
-    history: list[dict] = []
 
     if request.stream:
         async def event_generator():
             try:
                 async for chunk in _orchestrator.stream_turn(
                     user_input=request.message,
-                    history=history,
+                    session_id=session_id,
                     use_web=request.use_web,
                     model=request.model,
                     max_context_chars=request.max_context_chars or settings.max_context_chars,
@@ -291,7 +296,7 @@ async def chat(request: ChatRequest):
     try:
         result = await _orchestrator.run_turn(
             user_input=request.message,
-            history=history,
+            session_id=session_id,
             use_web=request.use_web,
             model=request.model,
             max_context_chars=request.max_context_chars or settings.max_context_chars,
@@ -599,3 +604,33 @@ async def delete_cache():
         deleted_count += await _cache.delete_pattern("search:*")
         deleted_count += await _cache.delete_pattern("fetch:*")
     return {"status": "ok", "deleted_keys": deleted_count, "request_id": request_id}
+
+
+# ---------------------------------------------------------------------------
+# Sessions
+# ---------------------------------------------------------------------------
+
+@app.get("/v1/sessions/{session_id}", tags=["sessions"])
+async def get_session(session_id: str):
+    """Retrieve turn history for a session."""
+    request_id = request_id_ctx.get("")
+    if not _session_store:
+        return JSONResponse(status_code=503, content={"error": "service_unavailable", "detail": "Session store not configured", "request_id": request_id})
+    
+    session = await _session_store.get_full_session(session_id)
+    if not session:
+        return JSONResponse(status_code=404, content={"error": "not_found", "detail": "Session not found", "request_id": request_id})
+    return session
+
+@app.delete("/v1/sessions/{session_id}", tags=["sessions"])
+async def delete_session(session_id: str):
+    """Delete a session from Redis."""
+    request_id = request_id_ctx.get("")
+    if not _session_store:
+        return JSONResponse(status_code=503, content={"error": "service_unavailable", "detail": "Session store not configured", "request_id": request_id})
+    
+    deleted = await _session_store.delete(session_id)
+    if not deleted:
+        return JSONResponse(status_code=404, content={"error": "not_found", "detail": "Session not found", "request_id": request_id})
+    return {"status": "ok", "session_id": session_id, "request_id": request_id}
+
